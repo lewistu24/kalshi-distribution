@@ -22,6 +22,10 @@ Run the Jupyter notebook to extract the distribution:
 jupyter notebook distribution.ipynb
 ```
 
+## Repository
+
+Full project available at: [https://github.com/lewistu24/kalshi-distribution](https://github.com/lewistu24/kalshi-distribution)
+
 ## Notes
 
 - Market data is fetched in real-time, so results will vary with current market conditions
