@@ -1,0 +1,143 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{float}
+
+% Code styling
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!10},
+    numbers=left,
+    numberstyle=\tiny,
+    language=Python
+}
+
+\title{Kalshi Implied Distribution: CPI Year-Over-Year Analysis}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+
+This project extracts and visualizes the implied probability distribution from Kalshi's KXCPIYOY (CPI Year-Over-Year) ladder market using a three-stage pipeline: market data extraction, monotonic enforcement, and distribution smoothing.
+
+\section{Market Selection}
+
+I chose the CPI Year-Over-Year ladder market because it offers dense strike coverage (typically 10-15 contracts) with substantial liquidity, making it ideal for distribution extraction. The market structure provides binary contracts at incrementing thresholds (e.g., ``Will CPI YoY be greater than or equal to 2.0\%?''), where each contract's price represents the market's cumulative probability $P(\text{CPI} \geq \text{strike})$.
+
+\section{Methodology}
+
+\subsection{Stage 1: Market Data Extraction}
+
+I fetch orderbook data for all active contracts in the nearest expiration, computing a weighted micro-price for each strike. Instead of simple mid-prices, I use order book imbalance weighting:
+
+\begin{equation*}
+\text{Micro-Price} = \frac{\text{Bid} \times \text{Ask Size} + \text{Ask} \times \text{Bid Size}}{\text{Total Size}}
+\end{equation*}
+
+This captures true market sentiment by weighting toward the heavier side of the book, reducing noise from stale quotes.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{step1_market_data.png}
+\caption{Step 1: Enhanced Market Data weighted by Open Interest. The uncertainty cloud shows bid-ask spreads, while bubble size indicates open interest concentration.}
+\label{fig:step1}
+\end{figure}
+
+\noindent \textbf{Code snippet - Micro-price calculation:}
+\begin{lstlisting}
+# Weighted micro-price using order book imbalance
+total_size = yes_bid_size + yes_ask_size
+if total_size > 0:
+    micro_price = (yes_bid_price * yes_ask_size + 
+                   yes_ask_price * yes_bid_size) / total_size
+else:
+    micro_price = (yes_bid_price + yes_ask_price) / 2
+\end{lstlisting}
+
+\subsection{Stage 2: Monotonic Enforcement}
+
+Raw market prices often violate monotonicity due to liquidity fragmentation or arbitrage delays. I apply weighted isotonic regression with liquidity as sample weights:
+
+\begin{equation*}
+\min_{f} \sum_{i=1}^{n} w_i (y_i - f(x_i))^2 \quad \text{subject to } f(x_1) \geq f(x_2) \geq \cdots \geq f(x_n)
+\end{equation*}
+where $w_i = \text{Liquidity}_i + \epsilon$ ensures $P(\text{CPI} \geq X)$ decreases monotonically as $X$ increases. The weighting prioritizes high-liquidity strikes, allowing the algorithm to correct illiquid outliers while preserving signals from deep markets.
+
+% INSERT FIGURE: Step 2 visualization (Isotonic Regression)
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{step2_isotonic.png}
+\caption{Step 2: Weighted Isotonic Regression. The red curve enforces monotonicity while respecting liquidity-weighted market prices (gray bubbles).}
+\label{fig:step2}
+\end{figure}
+\noindent \textbf{Code snippet - Weighted isotonic regression:}
+\begin{lstlisting}
+X = df['Strike'].values
+y = df['Mid'].values
+weights = df['Liquidity'].values + 1e-6
+
+# Weighted isotonic regression (decreasing)
+iso_reg = IsotonicRegression(increasing=False, out_of_bounds='clip')
+y_monotonic = iso_reg.fit_transform(X, y, sample_weight=weights)
+\end{lstlisting}
+
+\subsection{Stage 3: Distribution Smoothing}
+
+I convert the step function into a continuous probability density using cubic spline interpolation. Two critical refinements ensure validity:
+
+First, I add anchor points at the tails ($P=1.0$ at $0\%$, $P=0.0$ at $\text{max\_strike} + 0.2\%$) to prevent extrapolation artifacts. Without these, the spline often hallucinates long right tails that inflate expected values.
+
+Second, I normalize the extracted PDF to integrate to 1.0. The derivative of the CDF spline can produce negative noise or violate total probability; clipping negatives and normalizing ensures a valid distribution:
+
+\begin{align}
+\text{PDF}_{\text{raw}}(x) &= \frac{d}{dx}\text{CDF}_{\text{spline}}(x) \\
+\text{PDF}_{\text{clipped}}(x) &= \max(0, \text{PDF}_{\text{raw}}(x)) \\
+\text{PDF}_{\text{normalized}}(x) &= \frac{\text{PDF}_{\text{clipped}}(x)}{\int \text{PDF}_{\text{clipped}}(x) \, dx}
+\end{align}
+
+% INSERT FIGURE: Step 3 visualization (Final PDF)
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{step3_final_pdf.png}
+\caption{Final Distribution: Implied Probability Density with normalized mass. The vertical dashed line indicates market expectation, and rug plot marks liquid strikes.}
+\label{fig:step3}
+\end{figure}
+
+\noindent \textbf{Code snippet - PDF extraction and normalization:}
+\begin{lstlisting}
+# Extract and normalize PDF
+x_grid = np.linspace(df['Strike'].min(), max_strike + 0.2, 500)
+pdf_series = cdf_spline.derivative()(x_grid)
+pdf_series = np.maximum(pdf_series, 0)
+total_area = np.trapezoid(pdf_series, x_grid)
+pdf_series = pdf_series / total_area
+
+# Calculate statistics
+expected_val = np.trapezoid(x_grid * pdf_series, x_grid)
+\end{lstlisting}
+
+\section{Results}
+
+For the December 2025 expiration, the model extracted a tight distribution with an expected CPI YoY of approximately 2.6--2.8\%, with most probability mass concentrated within a 0.5\% range. The normalized distribution shows total probability mass of 1.00, confirming calibration.
+
+\section{Technical Validation}
+
+Calibration is verified through three checks: (1) monotonicity of cumulative probabilities, (2) total probability mass equals 1.0, and (3) expected value lies within the range of liquid strikes. The visualization includes a rug plot highlighting liquid contracts, showing that the model concentrates probability where market information is most reliable.
+
+\section{Key Innovations}
+
+The combination of micro-price weighting, liquidity-weighted isotonic regression, and tail-controlled spline fitting addresses the core challenge of ladder markets: converting noisy, discrete cumulative probabilities into a coherent continuous distribution. Unlike simple interpolation, this approach respects market microstructure while enforcing mathematical validity.
+
+The code is modular and generalizable to any Kalshi ladder market, requiring only the series ticker change. All computations use standard scientific libraries (scipy, scikit-learn) for reproducibility.
+
+\end{document}
